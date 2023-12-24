@@ -203,9 +203,9 @@ def encode_tokens(tokenizer, string, bos=True, device='cuda'):
         tokens = [tokenizer.bos_id()] + tokens
     return torch.tensor(tokens, dtype=torch.int, device=device)
 
-def _load_model(checkpoint_path, device, precision, use_tp):
+def _load_model(checkpoint_path, model_name, device, precision, use_tp):
     with torch.device('meta'):
-        model = Transformer.from_name(checkpoint_path.parent.name)
+        model = Transformer.from_name(model_name)
 
     if "int8" in str(checkpoint_path):
         print("Using int8 weight-only quantization!")
@@ -231,6 +231,7 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         apply_tp(model)
 
     model = model.to(device=device, dtype=precision)
+
     return model.eval()
 
 B_INST, E_INST = "[INST]", "[/INST]"
@@ -243,6 +244,7 @@ def main(
     top_k: int = 200,
     temperature: float = 0.8,
     checkpoint_path: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
+    model_name: str = None,
     compile: bool = True,
     compile_prefill: bool = False,
     profile: Optional[Path] = None,
@@ -252,6 +254,9 @@ def main(
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
     assert checkpoint_path.is_file(), checkpoint_path
+
+    if not model_name:
+        model_name = checkpoint_path.parent.name
 
     tokenizer_path = checkpoint_path.parent / "tokenizer.model"
     assert tokenizer_path.is_file(), tokenizer_path
@@ -271,10 +276,10 @@ def main(
 
     print("Loading model ...")
     t0 = time.time()
-    model = _load_model(checkpoint_path, device, precision, use_tp)
+    model = _load_model(checkpoint_path, model_name, device, precision, use_tp)
 
     if is_speculative:
-        draft_model = _load_model(draft_checkpoint_path, device, precision, use_tp)
+        draft_model = _load_model(draft_checkpoint_path, draft_checkpoint_path.parent.name, device, precision, use_tp)
     else:
         draft_model = None
 
@@ -396,6 +401,7 @@ if __name__ == '__main__':
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
+    parser.add_argument('--model_name', type=str, default="", help='Name of model type, defaults to parent folder of checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
@@ -405,5 +411,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path, args.speculate_k
+        args.temperature, args.checkpoint_path, args.model_name, args.compile, args.compile_prefill,
+        args.profile, args.draft_checkpoint_path, args.speculate_k
     )
