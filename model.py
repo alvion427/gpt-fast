@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
-
+import math
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -105,14 +105,18 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base)
         self.causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
 
-    def forward(self, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self,
+                idx: Tensor,
+                input_pos: Optional[Tensor] = None,
+                attn_output: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
         mask = self.causal_mask[None, None, input_pos]
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
         for i, layer in enumerate(self.layers):
-            x = layer(x, input_pos, freqs_cis, mask)
+            layer_attn_output = attn_output[:, i, :, :] if attn_output is not None else None
+            x = layer(x, input_pos, freqs_cis, mask, layer_attn_output)
         x = self.norm(x)
         logits = self.output(x)
         return logits
@@ -130,10 +134,37 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
-    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor, attn_output: Optional[Tensor] = None) -> Tensor:
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos, attn_output=attn_output)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
+
+def joev_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool, device=query.device).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+
+    if attn_mask is not None:
+        # Expand attn_bias to match the dimensions of attn_mask
+        attn_bias = attn_bias.view(1, 1, L, S)
+        if attn_mask.dtype == torch.bool:
+            attn_mask = attn_mask.to(dtype=query.dtype, device=query.device)
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+
+    attn_weight = torch.matmul(query, key.transpose(-2, -1)) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = F.softmax(attn_weight, dim=-1)
+    attn_weight = F.dropout(attn_weight, p=dropout_p, training=False)
+
+    output = torch.matmul(attn_weight, value)
+    return output, attn_weight
 
 
 class Attention(nn.Module):
@@ -160,7 +191,8 @@ class Attention(nn.Module):
             wv = state_dict.pop(prefix + "wv.weight")
             state_dict[prefix + "wqkv.weight"] = torch.cat([wq, wk, wv])
 
-    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: Tensor, input_pos: Optional[Tensor] = None,
+                attn_output: Optional[Tensor] = None) -> Tensor:
         bsz, seqlen, _ = x.shape
 
         kv_size = self.n_local_heads * self.head_dim
@@ -180,10 +212,16 @@ class Attention(nn.Module):
 
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+
+        if attn_output is not None:
+            y, attn = joev_scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+            assert attn.shape[0] == 1
+            attn = attn.squeeze(dim=0).transpose(0, 1)
+            attn_output.copy_(attn)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
-
         y = self.wo(y)
         return y
 

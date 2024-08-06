@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
+from img_util import prompt_to_texture
+
 import torch
 import torch._dynamo.config
 import torch._inductor.config
@@ -47,30 +49,51 @@ def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
-def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
-    # input_pos: [B, S]
-    logits = model(x, input_pos)
-    return sample(logits, **sampling_kwargs)[0]
+def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, output_attn: bool,
+            **sampling_kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if output_attn:
+        attn_output = torch.zeros(x.size(1), model.config.n_layer, model.config.n_head, model.max_seq_length)
+    else:
+        attn_output = None
 
-def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+    # input_pos: [B, S]
+    logits = model(x, input_pos, attn_output=attn_output)
+    return sample(logits, **sampling_kwargs)[0], attn_output
+
+def decode_one_token(
+    model: Transformer,
+    x: torch.Tensor,
+    input_pos: torch.Tensor,
+    output_attn: bool,
+    **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
-    logits = model(x, input_pos)
-    return sample(logits, **sampling_kwargs)
+    attn_output = torch.zeros(1, model.config.n_layer, model.config.n_head, model.max_seq_length) if output_attn else None
+    logits = model(x, input_pos, attn_output)
+    return sample(logits, **sampling_kwargs) + (attn_output,)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
+def decode_n_tokens(
+    model: Transformer,
+    cur_token: torch.Tensor,
+    input_pos: torch.Tensor,
+    num_new_tokens: int,
+    output_attn: bool,
+    callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
+    new_attn_outputs = [] if output_attn else None
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
-            next_token, next_prob = decode_one_token(
-                model, cur_token, input_pos, **sampling_kwargs
+            next_token, next_prob, next_attn_output = decode_one_token(
+                model, cur_token, input_pos, output_attn, **sampling_kwargs
             )
         input_pos += 1
         new_tokens.append(next_token.clone())
         callback(new_tokens[-1])
         new_probs.append(next_prob.clone())
         cur_token = next_token.view(1, -1)
-    return new_tokens, new_probs
+        if output_attn:
+            new_attn_outputs.append(next_attn_output)
+    return new_tokens, new_probs, new_attn_outputs
 
 
 def model_forward(model, x, input_pos):
@@ -87,7 +110,7 @@ def speculative_decode(
     # draft model inference sequentially
     device = cur_token.device
     orig_input_pos = torch.tensor([input_pos], dtype=torch.int64, device=cur_token.device)
-    draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
+    draft_tokens, draft_probs, _ = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
 
     draft_tokens = torch.cat(draft_tokens)
     # parallel inference on target model using draft tokens
@@ -135,9 +158,10 @@ def generate(
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
+    output_attn: bool = False,
     callback = lambda x: x,
     **sampling_kwargs
-) -> torch.Tensor:
+) -> (torch.Tensor, Optional[dict], Optional[torch.Tensor]):
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
     """
@@ -164,10 +188,16 @@ def generate(
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
-    next_token = prefill(model, prompt.view(1, -1), input_pos, **sampling_kwargs)
+
+    next_token, prefill_attn_output = prefill(model, prompt.view(1, -1), input_pos, output_attn, **sampling_kwargs)
     if is_speculative:
-        prefill(draft_model, prompt.view(1, -1), input_pos, **sampling_kwargs)
+        prefill(draft_model, prompt.view(1, -1), input_pos, False, **sampling_kwargs)
     seq[T] = next_token
+
+    if output_attn:
+        attn_outputs = [prefill_attn_output]
+    else:
+        attn_outputs = None
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
@@ -189,13 +219,21 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(1, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+        generated_tokens, _, new_attn_outputs = decode_n_tokens(
+            model,
+            next_token.view(1, -1),
+            input_pos,
+            max_new_tokens - 1,
+            output_attn,
+            callback=callback, **sampling_kwargs)
         seq[T + 1:] = torch.cat(generated_tokens)
+        if output_attn:
+            attn_outputs += new_attn_outputs
 
     generate_stats = {
         'accept_counts': accept_counts
     }
-    return seq, generate_stats
+    return seq, generate_stats, attn_outputs
 
 def encode_tokens(tokenizer, string, bos=True, device='cuda'):
     tokens = tokenizer.encode(string)
@@ -236,6 +274,59 @@ def _load_model(checkpoint_path, model_name, device, precision, use_tp):
 
 B_INST, E_INST = "[INST]", "[/INST]"
 
+
+def write_attention_texture(attn_texture_path, attn_outputs, token_strings):
+    max_tokens = attn_outputs[0].size(3)
+    num_tokens = len(token_strings)
+
+    # Initialize a tensor to store the average attention per token
+    avg_attention = torch.zeros(max_tokens)
+
+    sum_attention = torch.zeros_like(avg_attention)
+
+    # 1 based index
+    token_idx = 1
+
+    # Sum the attention from all layers and heads for the current token
+    for attn_block in attn_outputs:
+        for i in range(attn_block.size(0)):
+            attn = attn_block[i]
+
+            # Considering only valid tokens (up to the current token index)
+            attn = attn[:, :, :token_idx]
+
+            # average attention of all layers and heads for this token
+            count = attn.size(0) * attn.size(1)
+            token_avg_attention = attn.sum(dim=(0, 1)) / count
+
+            # because attention values are normalized to sum to 1 for each token, tokens earlier in the sequence
+            # naturally have higher attention values than later tokens, so we scale them to be equivalent to the last
+            # token
+            position_scale = token_idx / num_tokens
+            token_avg_attention *= position_scale
+
+            # accumulate attention in sum_attention to compute global average
+            token_avg_attention = torch.nn.functional.pad(token_avg_attention, (0, max_tokens - token_idx))
+            sum_attention += token_avg_attention
+            token_idx += 1
+
+    avg_attention = sum_attention / num_tokens
+    avg_attention = avg_attention[1:num_tokens]
+
+    # Call prompt_to_texture to create an image with the prompt and attention weights
+    img = prompt_to_texture(token_strings, avg_attention)
+
+    # Save the image
+    img.save(attn_texture_path)
+
+# Example usage
+# if __name__ == "__main__":
+#     # Example prompt tokens and attention outputs
+#     prompt_tokens = ["This", "is", "a", "sample", "prompt", "for", "attention", "visualization"]
+#     attn_outputs = [torch.rand(3, 4, 8) for _ in range(len(prompt_tokens))]  # Replace with actual attention data
+#     write_attention_texture('attention_visualization.png', attn_outputs, prompt_tokens)
+
+
 def main(
     prompt: str = "Hello, my name is",
     interactive: bool = False,
@@ -250,6 +341,7 @@ def main(
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
+    attn_texture_path: Optional[Path] = None
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -347,10 +439,11 @@ def main(
             torch.profiler._utils._init_for_cuda_graphs()
             prof = torch.profiler.profile()
         with prof:
-            y, metrics = generate(
+            y, metrics, attn_outputs = generate(
                 model,
                 encoded,
                 max_new_tokens,
+                output_attn=attn_texture_path is not None,
                 draft_model=draft_model,
                 speculate_k=speculate_k,
                 interactive=interactive,
@@ -369,6 +462,10 @@ def main(
                 prof.export_chrome_trace(f"{profile}.json")
         torch.cuda.synchronize()
         t = time.perf_counter() - t0
+
+        if attn_texture_path is not None:
+            token_strings = [tokenizer.IdToPiece(t).replace('▁', " ") for t in y.tolist()]
+            write_attention_texture(attn_texture_path, attn_outputs, token_strings)
 
         if not interactive:
             print(tokenizer.decode(y.tolist()))
@@ -407,10 +504,11 @@ if __name__ == '__main__':
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
+    parser.add_argument('--attn_texture_path', type=Path, default=None, help="Path to write out the attention texture")
 
     args = parser.parse_args()
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.top_k,
         args.temperature, args.checkpoint_path, args.model_name, args.compile, args.compile_prefill,
-        args.profile, args.draft_checkpoint_path, args.speculate_k
+        args.profile, args.draft_checkpoint_path, args.speculate_k, attn_texture_path=args.attn_texture_path
     )
